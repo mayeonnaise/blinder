@@ -1,7 +1,7 @@
 use std::iter;
 
 use crate::list::List;
-use tantivy::query::{BooleanQuery, BoostQuery, DisjunctionMaxQuery, Occur, Query};
+use tantivy::query::{BooleanQuery, BoostQuery, DisjunctionMaxQuery, Occur, Query, QueryClone};
 
 pub struct QueryDecomposer<'a> {
     all_subqueries: List<'a, Box<dyn Query>>,
@@ -25,16 +25,16 @@ impl<'a> QueryDecomposer<'a> {
         };
 
         let query = match query.downcast::<BoostQuery>() {
-            Ok(_query) => todo!(),
+            Ok(query) => return decomposer.decompose_boost(query),
             Err(query) => query,
         };
 
-        match query.downcast::<DisjunctionMaxQuery>() {
-            Ok(_query) => todo!(),
+        let query = match query.downcast::<DisjunctionMaxQuery>() {
+            Ok(query) => return decomposer.decompose_disjunction_max(query),
             Err(query) => query,
         };
 
-        unimplemented!()
+        self.all_subqueries.push(query);
     }
 
     fn decompose_boolean(&mut self, query: Box<BooleanQuery>) {
@@ -72,28 +72,33 @@ impl<'a> QueryDecomposer<'a> {
             return;
         }
 
-        self.all_subqueries.map_in_place(|subquery| {
-            Box::new(BooleanQuery::new(
-                iter::once((Occur::Must, subquery))
+        for subquery in &mut self.all_subqueries {
+            *subquery = Box::new(BooleanQuery::new(
+                iter::once((Occur::Must, subquery.box_clone()))
                     .chain(
                         exclusion_clauses
                             .iter()
                             .map(|exclusion_clause| (Occur::MustNot, exclusion_clause.box_clone())),
                     )
                     .collect(),
-            ))
-        });
+            ));
+        }
+    }
 
-        // for subquery in &mut self.all_subqueries {
-        //     *subquery = Box::new(BooleanQuery::new(
-        //         iter::once((Occur::Must, subquery.box_clone()))
-        //             .chain(
-        //                 exclusion_clauses
-        //                     .iter()
-        //                     .map(|exclusion_clause| (Occur::MustNot, exclusion_clause.box_clone())),
-        //             )
-        //             .collect(),
-        //     ));
-        // }
+    fn decompose_boost(&mut self, query: Box<BoostQuery>) {
+        if query.boost() == 1.0 {
+            return self.decompose(query.query());
+        }
+
+        self.decompose(query.query());
+        for subquery in &mut self.all_subqueries {
+            *subquery = Box::new(BoostQuery::new(subquery.box_clone(), query.boost()));
+        }
+    }
+
+    fn decompose_disjunction_max(&mut self, query: Box<DisjunctionMaxQuery>) {
+        for subquery in query.disjuncts() {
+            self.decompose(subquery.box_clone());
+        }
     }
 }
