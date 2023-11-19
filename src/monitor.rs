@@ -4,30 +4,27 @@ use tantivy::{
     collector::{Collector, SegmentCollector, TopDocs},
     query::{BooleanQuery, Query},
     schema::Schema,
-    DocId, Document, Index,
+    DocId, Index, TantivyDocument,
 };
 
-use crate::monitor_query::MonitorQuery;
+use crate::{monitor_query::MonitorQuery, presearcher::Presearcher};
 
-pub struct Monitor {
+pub struct Monitor<P: Presearcher> {
     query_index: Index,
     document_schema: Schema,
     monitor_queries: HashSet<MonitorQuery>,
+    presearcher: P,
 }
 
-impl Monitor {
-    pub fn match_query(&self, document: Document) -> Result<String, Box<dyn Error>> {
+impl<P: Presearcher> Monitor<P> {
+    pub fn match_query(&self, document: &TantivyDocument) -> Result<String, Box<dyn Error>> {
         let reader = self.query_index.reader()?;
         let searcher = reader.searcher();
 
-        let document_query = self.document_to_query(&document)?;
+        let document_query = self.presearcher.convert_document_to_query(document);
         let documents = searcher.search(&*document_query, &TopDocs::with_limit(10));
 
         Ok("".to_string())
-    }
-
-    fn document_to_query(&self, document: &Document) -> Result<Box<dyn Query>, Box<dyn Error>> {
-        todo!()
     }
 }
 
