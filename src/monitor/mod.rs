@@ -1,3 +1,7 @@
+pub(crate) mod query;
+
+pub use self::query::MonitorQuery;
+
 use std::collections::{HashMap, HashSet};
 
 use tantivy::{
@@ -8,10 +12,11 @@ use tantivy::{
 };
 
 use crate::{
-    monitor_query::{MonitorQuery, MonitorQuerySchemaBuilder, MONITOR_QUERY_ID_FIELD_NAME},
     presearcher::Presearcher,
-    QueryDecomposer,
+    query_decomposer::QueryDecomposer,
 };
+
+use self::query::{MonitorQuerySchemaBuilder, MONITOR_QUERY_ID_FIELD_NAME};
 
 pub struct Monitor<P: Presearcher> {
     query_index: Index,
@@ -265,9 +270,9 @@ mod test {
         Term, query_grammar::Occur,
     };
 
-    use crate::{monitor_query::MonitorQuery, presearcher::TermFilteredPresearcher};
+    use crate::presearcher::TermFilteredPresearcher;
 
-    use super::{BasicStatisticsProvider, Monitor};
+    use super::{*, BasicStatisticsProvider, Monitor};
 
     #[test]
     fn test_monitor_basic() {
@@ -305,7 +310,7 @@ mod test {
 
         assert!(matches.contains(&id));
 
-        let document = doc!(body => "Michael");
+        let document = doc!(body => "Michael Bay");
 
         let no_matches = monitor
             .match_document(&document)
@@ -341,7 +346,7 @@ mod test {
                     )),
                 ),
                 (
-                    Occur::Must,
+                    Occur::Should,
                     Box::new(TermQuery::new(
                         Term::from_field_text(body, "bloomberg"),
                         IndexRecordOption::Basic,
@@ -361,5 +366,29 @@ mod test {
             .expect("should not error matching document");
 
         assert!(matches.contains(&id));
+
+        let document = doc!(body => "Donald Trump");
+
+        let matches = monitor
+            .match_document(&document)
+            .expect("should not error matching document");
+
+        assert!(matches.contains(&id));
+
+        let document = doc!(body => "Bloomberg Trump");
+
+        let matches = monitor
+            .match_document(&document)
+            .expect("should not error matching document");
+
+        assert!(matches.contains(&id));
+
+        let document = doc!(body => "Rishi Sunak");
+
+        let matches = monitor
+            .match_document(&document)
+            .expect("should not error matching document");
+
+        assert!(matches.is_empty());
     }
 }

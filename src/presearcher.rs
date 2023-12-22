@@ -10,7 +10,7 @@ use tantivy::{
     Document, Score, TantivyDocument, TantivyError, Term,
 };
 
-use crate::monitor_query::ANYTERM_FIELD;
+use crate::monitor::query::ANYTERM_FIELD;
 
 fn idf(doc_freq: u64, doc_count: u64) -> Score {
     assert!(doc_count >= doc_freq);
