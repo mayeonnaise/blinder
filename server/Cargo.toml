@@ -1,14 +1,17 @@
 [package]
-name = "blinker"
+name = "blinker-server"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+blinker = { path = ".." }
 serde = { version = "1.0", features = ["derive"] }
 tantivy = { git = "https://github.com/mayeonnaise/tantivy", branch = "blinder" }
-dashmap = { version = "5.3" }
 
-[workspace]
-members = ["server"]
+[dependencies.rocket]
+version = "0.5.0-rc.4"
+features = ["json"]
+

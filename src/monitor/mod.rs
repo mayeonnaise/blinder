@@ -2,25 +2,27 @@ pub(crate) mod query;
 
 pub use self::query::MonitorQuery;
 
-use std::collections::{HashMap, HashSet};
+use dashmap::{mapref::entry::Entry, DashMap};
+
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use tantivy::{
     collector::{Collector, SegmentCollector},
     query::{Bm25StatisticsProvider, Query},
     schema::{Field, Schema},
-    DocAddress, DocId, Index, IndexWriter, Searcher, TantivyDocument, TantivyError, Term,
+    DocAddress, DocId, Index, IndexWriter, Searcher, TantivyDocument, TantivyError, Term, tokenizer::TokenizerManager,
 };
 
-use crate::{
-    presearcher::Presearcher,
-    query_decomposer::QueryDecomposer,
-};
+use crate::{presearcher::Presearcher, query_decomposer::QueryDecomposer};
 
 use self::query::{MonitorQuerySchemaBuilder, MONITOR_QUERY_ID_FIELD_NAME};
 
 pub struct Monitor<P: Presearcher> {
     query_index: Index,
-    query_cache: HashMap<u64, MonitorQuery>,
+    query_store: DashMap<u64, MonitorQuery>,
     presearcher: P,
     document_schema: Schema,
 }
@@ -31,10 +33,18 @@ impl<P: Presearcher> Monitor<P> {
         let query_index = Index::create_in_ram(schema);
         Monitor::<P> {
             query_index,
-            query_cache: HashMap::new(),
+            query_store: DashMap::default(),
             presearcher,
             document_schema,
         }
+    }
+
+    pub fn tokenizers(&self) -> &TokenizerManager {
+        self.query_index.tokenizers()
+    }
+
+    pub fn schema(&self) -> Schema {
+        self.query_index.schema()
     }
 
     pub fn match_document(&self, document: &TantivyDocument) -> Result<HashSet<u64>, TantivyError> {
@@ -51,7 +61,7 @@ impl<P: Presearcher> Monitor<P> {
             &*document_query,
             &PresearchQueryMatchCollector {
                 query_searcher: &query_searcher,
-                monitor_queries: &self.query_cache,
+                monitor_queries: &self.query_store,
                 schema: self.query_index.schema(),
             },
         )?;
@@ -65,7 +75,7 @@ impl<P: Presearcher> Monitor<P> {
         index_writer.commit()?;
 
         for monitor_query_id in presearcher_query_matches {
-            if let Some(monitor_query) = self.query_cache.get(&monitor_query_id) {
+            if let Some(monitor_query) = self.query_store.get(&monitor_query_id) {
                 let reader = index.reader()?;
                 let searcher = reader.searcher();
 
@@ -81,7 +91,7 @@ impl<P: Presearcher> Monitor<P> {
         Ok(actual_query_matches)
     }
 
-    pub fn register_query(&mut self, monitor_query: MonitorQuery) -> Result<u64, TantivyError> {
+    pub fn register_query(&self, monitor_query: MonitorQuery) -> Result<u64, TantivyError> {
         let mut all_subqueries = Vec::<Box<dyn Query>>::new();
         let mut query_decomposer = QueryDecomposer::new(&mut all_subqueries);
         query_decomposer.decompose(monitor_query.query.box_clone());
@@ -103,7 +113,7 @@ impl<P: Presearcher> Monitor<P> {
             index_writer.add_document(subquery_document)?;
         }
 
-        self.query_cache.insert(monitor_query.id, monitor_query);
+        self.query_store.insert(monitor_query.id, monitor_query);
 
         index_writer.commit()
     }
@@ -111,7 +121,7 @@ impl<P: Presearcher> Monitor<P> {
 
 struct PresearchQueryMatchCollector<'a> {
     query_searcher: &'a Searcher,
-    monitor_queries: &'a HashMap<u64, MonitorQuery>,
+    monitor_queries: &'a DashMap<u64, MonitorQuery>,
     schema: Schema,
 }
 
@@ -226,9 +236,10 @@ impl SegmentCollector for QueryMatchChildCollector {
     }
 }
 
-struct BasicStatisticsProvider {
-    document_count: u64,
-    term_doc_freq: HashMap<Term, u64>,
+#[derive(Default)]
+pub struct BasicStatisticsProvider {
+    document_count: AtomicU64,
+    term_doc_freq: DashMap<Term, u64>,
 }
 
 impl Bm25StatisticsProvider for BasicStatisticsProvider {
@@ -237,7 +248,7 @@ impl Bm25StatisticsProvider for BasicStatisticsProvider {
     }
 
     fn total_num_docs(&self) -> tantivy::Result<u64> {
-        Ok(self.document_count)
+        Ok(self.document_count.load(Ordering::SeqCst))
     }
 
     fn doc_freq(&self, term: &Term) -> tantivy::Result<u64> {
@@ -246,15 +257,17 @@ impl Bm25StatisticsProvider for BasicStatisticsProvider {
 }
 
 impl BasicStatisticsProvider {
-    fn add_document(&mut self, document: &str) {
-        self.document_count += 1;
+    fn add_term(&self, field: Field, token: &str) {
+        self.document_count.fetch_add(1, Ordering::SeqCst);
 
-        for term in document.split_whitespace() {
-            let freq = self
-                .term_doc_freq
-                .entry(Term::from_field_text(Field::from_field_id(0), term))
-                .or_default();
-            *freq += 1;
+        match self.term_doc_freq.entry(Term::from_field_text(field, token)) {
+            Entry::Occupied(mut entry) => {
+                let term_frequency = entry.get() + 1;
+                entry.insert(term_frequency);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(1);
+            }
         }
     }
 }
@@ -265,14 +278,15 @@ mod test {
 
     use tantivy::{
         doc,
-        query::{TermQuery, BooleanQuery},
+        query::{BooleanQuery, TermQuery},
+        query_grammar::Occur,
         schema::{IndexRecordOption, Schema, TEXT},
-        Term, query_grammar::Occur,
+        Term,
     };
 
     use crate::presearcher::TermFilteredPresearcher;
 
-    use super::{*, BasicStatisticsProvider, Monitor};
+    use super::{BasicStatisticsProvider, Monitor, *};
 
     #[test]
     fn test_monitor_basic() {
@@ -282,12 +296,12 @@ mod test {
 
         let presearcher = TermFilteredPresearcher {
             scorer: Box::new(BasicStatisticsProvider {
-                document_count: 0,
-                term_doc_freq: HashMap::<Term, u64>::new(),
+                document_count: 0.into(),
+                term_doc_freq: DashMap::<Term, u64>::new(),
             }),
         };
 
-        let mut monitor = Monitor::<TermFilteredPresearcher>::new(document_schema, presearcher);
+        let monitor = Monitor::<TermFilteredPresearcher>::new(document_schema, presearcher);
 
         let id = 0;
         let monitor_query = MonitorQuery {
@@ -327,8 +341,8 @@ mod test {
 
         let presearcher = TermFilteredPresearcher {
             scorer: Box::new(BasicStatisticsProvider {
-                document_count: 0,
-                term_doc_freq: HashMap::<Term, u64>::new(),
+                document_count: 0.into(),
+                term_doc_freq: DashMap::<Term, u64>::new(),
             }),
         };
 

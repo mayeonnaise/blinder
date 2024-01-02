@@ -33,7 +33,7 @@ pub trait Presearcher {
 }
 
 pub struct TermFilteredPresearcher {
-    pub scorer: Box<dyn Bm25StatisticsProvider>,
+    pub scorer: Box<dyn Bm25StatisticsProvider + Send + Sync>,
 }
 
 impl TermFilteredPresearcher {
