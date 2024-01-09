@@ -13,7 +13,8 @@ use tantivy::{
     collector::{Collector, SegmentCollector},
     query::{Bm25StatisticsProvider, Query},
     schema::{Field, Schema},
-    DocAddress, DocId, Index, IndexWriter, Searcher, TantivyDocument, TantivyError, Term, tokenizer::TokenizerManager,
+    tokenizer::TokenizerManager,
+    DocAddress, DocId, Index, IndexWriter, Searcher, TantivyDocument, TantivyError, Term,
 };
 
 use crate::{presearcher::Presearcher, query_decomposer::QueryDecomposer};
@@ -68,7 +69,7 @@ impl<P: Presearcher> Monitor<P> {
 
         let mut actual_query_matches: HashSet<u64> = HashSet::new();
 
-        let index = Index::create_in_ram(self.document_schema.clone());
+        let index = Index::create_in_ram(self.query_index.schema());
 
         let mut index_writer: IndexWriter = index.writer(15_000_000)?;
         index_writer.add_document(document.clone())?;
@@ -260,7 +261,10 @@ impl BasicStatisticsProvider {
     fn add_term(&self, field: Field, token: &str) {
         self.document_count.fetch_add(1, Ordering::SeqCst);
 
-        match self.term_doc_freq.entry(Term::from_field_text(field, token)) {
+        match self
+            .term_doc_freq
+            .entry(Term::from_field_text(field, token))
+        {
             Entry::Occupied(mut entry) => {
                 let term_frequency = entry.get() + 1;
                 entry.insert(term_frequency);

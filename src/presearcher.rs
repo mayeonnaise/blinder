@@ -157,7 +157,10 @@ impl Presearcher for TermFilteredPresearcher {
         let mut terms = Vec::<Term>::new();
 
         for (field, value) in document.iter_fields_and_values() {
+            dbg!("Got here 1");
             let field_entry = schema.get_field_entry(field);
+            dbg!("Got here 2");
+            dbg!(document);
             let field_type = field_entry.field_type();
             let indexing_options_opt = match field_type {
                 tantivy::schema::FieldType::Str(options) => options.get_indexing_options(),
