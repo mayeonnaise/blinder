@@ -49,7 +49,7 @@ impl<'a, T> List<'a, T> {
             .collect()
     }
 
-    pub fn saved<'b>(&'b mut self) -> List<'b, T> {
+    pub fn saved(&'_ mut self) -> List<'_, T> {
         let offset = self.items.len();
         List {
             items: self.items,

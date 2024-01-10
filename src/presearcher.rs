@@ -1,13 +1,18 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
+use dashmap::{mapref::entry::Entry, DashMap};
 use tantivy::{
     query::{
         Bm25StatisticsProvider, BooleanQuery, Query, QueryDocumentTree, TermQuery, TermSetQuery,
     },
     query_grammar::Occur,
-    schema::{Field, IndexRecordOption, Schema, Value},
+    schema::{Field, IndexRecordOption, OwnedValue, Schema, Value},
     tokenizer::{Token, TokenizerManager},
-    Document, Score, TantivyDocument, TantivyError, Term,
+    Document, Score, TantivyError, Term,
 };
 
 use crate::monitor::query::ANYTERM_FIELD;
@@ -23,20 +28,61 @@ pub trait Presearcher {
         &self,
         query: &dyn Query,
         schema: Schema,
-    ) -> Result<TantivyDocument, TantivyError>;
-    fn convert_document_to_query(
+    ) -> Result<HashMap<Field, OwnedValue>, TantivyError>;
+    fn convert_document_to_query<D: Debug + Document>(
         &self,
-        document: &TantivyDocument,
+        document: &D,
         schema: Schema,
         tokenizer_manager: &TokenizerManager,
     ) -> Result<Box<dyn Query>, TantivyError>;
 }
 
-pub struct TermFilteredPresearcher {
-    pub scorer: Box<dyn Bm25StatisticsProvider + Send + Sync>,
+pub trait PresearcherScorer {
+    fn score(&self, query_document_tree: &QueryDocumentTree) -> f32;
+    fn add_term(&self, term: Term);
+    fn add_document_count(&self);
 }
 
-impl TermFilteredPresearcher {
+#[derive(Default)]
+pub struct TfIdfScorer {
+    token_count: AtomicU64,
+    document_count: AtomicU64,
+    term_frequencies: DashMap<Term, u64>,
+}
+
+impl Bm25StatisticsProvider for TfIdfScorer {
+    fn total_num_tokens(&self, _: Field) -> tantivy::Result<u64> {
+        Ok(self.token_count.load(Ordering::Relaxed))
+    }
+
+    fn total_num_docs(&self) -> tantivy::Result<u64> {
+        Ok(self.document_count.load(Ordering::Relaxed))
+    }
+
+    fn doc_freq(&self, term: &Term) -> tantivy::Result<u64> {
+        Ok(self.term_frequencies.get(term).map_or(0, |freq| *freq))
+    }
+}
+
+impl PresearcherScorer for TfIdfScorer {
+    fn add_document_count(&self) {
+        self.document_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_term(&self, term: Term) {
+        self.token_count.fetch_add(1, Ordering::Relaxed);
+
+        match self.term_frequencies.entry(term) {
+            Entry::Occupied(mut entry) => {
+                let term_frequency = entry.get() + 1;
+                entry.insert(term_frequency);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(1);
+            }
+        }
+    }
+
     fn score(&self, query_document_tree: &QueryDocumentTree) -> f32 {
         return match query_document_tree {
             QueryDocumentTree::Conjunction(trees) => trees.iter().fold(0_f32, |max_score, tree| {
@@ -56,7 +102,7 @@ impl TermFilteredPresearcher {
                 }
             }),
             QueryDocumentTree::Term(term) => {
-                return match (self.scorer.doc_freq(term), self.scorer.total_num_docs()) {
+                return match (self.doc_freq(term), self.total_num_docs()) {
                     (Ok(doc_freq), Ok(total_num_docs)) => idf(doc_freq, total_num_docs),
                     _ => 0_f32,
                 }
@@ -64,7 +110,13 @@ impl TermFilteredPresearcher {
             QueryDocumentTree::AnyTerm => -1_f32,
         };
     }
+}
 
+pub struct TermFilteredPresearcher<S: PresearcherScorer> {
+    pub scorer: Box<S>,
+}
+
+impl<S: PresearcherScorer> TermFilteredPresearcher<S> {
     fn to_field_terms(
         &self,
         query_document_tree: &QueryDocumentTree,
@@ -75,7 +127,7 @@ impl TermFilteredPresearcher {
             QueryDocumentTree::Conjunction(trees) => {
                 let mut sorted_trees = trees
                     .iter()
-                    .map(|tree| (self.score(tree), tree))
+                    .map(|tree| (self.scorer.score(tree), tree))
                     .collect::<Vec<(f32, &QueryDocumentTree)>>();
 
                 sorted_trees.sort_by(|(score_a, _), (score_b, _)| score_b.total_cmp(score_a));
@@ -110,13 +162,13 @@ impl TermFilteredPresearcher {
     }
 }
 
-impl Presearcher for TermFilteredPresearcher {
+impl<S: PresearcherScorer> Presearcher for TermFilteredPresearcher<S> {
     fn convert_query_to_document(
         &self,
         query: &dyn Query,
         schema: Schema,
-    ) -> Result<TantivyDocument, TantivyError> {
-        let mut document = TantivyDocument::new();
+    ) -> Result<HashMap<Field, OwnedValue>, TantivyError> {
+        let mut document = HashMap::<Field, OwnedValue>::new();
         let mut field_terms = HashMap::<Field, HashSet<Term>>::new();
         self.to_field_terms(&query.to_ast(), &mut field_terms, schema.clone())?;
 
@@ -131,12 +183,12 @@ impl Presearcher for TermFilteredPresearcher {
                         .collect::<Vec<String>>()
                         .join(" ");
 
-                    document.add_text(field, joined_terms);
+                    document.insert(field, OwnedValue::Str(joined_terms));
                 }
                 tantivy::schema::FieldType::Bool(_) => match schema.get_field(ANYTERM_FIELD) {
                     Ok(anyterm_field) => {
                         if field == anyterm_field {
-                            document.add_bool(anyterm_field, true);
+                            document.insert(anyterm_field, OwnedValue::Bool(true));
                         }
                     }
                     Err(_) => continue,
@@ -148,19 +200,18 @@ impl Presearcher for TermFilteredPresearcher {
         Ok(document)
     }
 
-    fn convert_document_to_query(
+    fn convert_document_to_query<D: Debug + Document>(
         &self,
-        document: &TantivyDocument,
+        document: &D,
         schema: Schema,
         tokenizer_manager: &TokenizerManager,
     ) -> Result<Box<dyn Query>, TantivyError> {
+        self.scorer.add_document_count();
+
         let mut terms = Vec::<Term>::new();
 
         for (field, value) in document.iter_fields_and_values() {
-            dbg!("Got here 1");
             let field_entry = schema.get_field_entry(field);
-            dbg!("Got here 2");
-            dbg!(document);
             let field_type = field_entry.field_type();
             let indexing_options_opt = match field_type {
                 tantivy::schema::FieldType::Str(options) => options.get_indexing_options(),
@@ -168,10 +219,6 @@ impl Presearcher for TermFilteredPresearcher {
                     options.get_text_indexing_options()
                 }
                 _ => {
-                    // return Err(TantivyError::SchemaError(format!(
-                    //     "{:?} is not a text field.",
-                    //     field_entry.name()
-                    // )))
                     continue;
                 }
             };
@@ -196,7 +243,11 @@ impl Presearcher for TermFilteredPresearcher {
                 ))
             })?);
 
-            let mut to_term = |token: &Token| terms.push(Term::from_field_text(field, &token.text));
+            let mut to_term = |token: &Token| {
+                let term = Term::from_field_text(field, &token.text);
+                self.scorer.add_term(term.clone());
+                terms.push(term);
+            };
 
             token_stream.process(&mut to_term);
         }
@@ -222,41 +273,14 @@ mod test {
 
     use tantivy::schema::{Schema, TEXT};
     use tantivy::Index;
-    use tantivy::{query::Bm25StatisticsProvider, schema::Field, Result, Term};
+    use tantivy::{schema::Field, Term};
 
-    use super::QueryDocumentTree;
-    use super::TermFilteredPresearcher;
+    use super::*;
 
-    struct TestStatisticsProvider {
-        document_count: u64,
-        term_doc_freq: HashMap<Term, u64>,
-    }
-
-    impl Bm25StatisticsProvider for TestStatisticsProvider {
-        fn total_num_tokens(&self, _: Field) -> Result<u64> {
-            Ok(0)
-        }
-
-        fn total_num_docs(&self) -> Result<u64> {
-            Ok(self.document_count)
-        }
-
-        fn doc_freq(&self, term: &Term) -> Result<u64> {
-            Ok(self.term_doc_freq.get(term).map_or(0, |freq| freq.clone()))
-        }
-    }
-
-    impl TestStatisticsProvider {
-        fn add_document(&mut self, document: &str) {
-            self.document_count += 1;
-
-            for term in document.split_whitespace() {
-                let freq = self
-                    .term_doc_freq
-                    .entry(Term::from_field_text(Field::from_field_id(0), term))
-                    .or_default();
-                *freq += 1;
-            }
+    fn add_document<P: PresearcherScorer>(field: &Field, value: &str, scorer: &P) {
+        scorer.add_document_count();
+        for text in value.split_whitespace() {
+            scorer.add_term(Term::from_field_text(field.clone(), text));
         }
     }
 
@@ -266,17 +290,10 @@ mod test {
         let mut schema_builder = Schema::builder();
         let body = schema_builder.add_text_field("body", TEXT);
 
-        let mut stats_provider = TestStatisticsProvider {
-            document_count: 0,
-            term_doc_freq: HashMap::<Term, u64>::new(),
-        };
-        stats_provider.add_document("This is the first document");
-        stats_provider.add_document("This is the second document");
-        stats_provider.add_document("This is the third document");
-
-        let presearcher: TermFilteredPresearcher = TermFilteredPresearcher {
-            scorer: Box::new(stats_provider),
-        };
+        let scorer = TfIdfScorer::default();
+        add_document(&body, "This is the first document", &scorer);
+        add_document(&body, "This is the second document", &scorer);
+        add_document(&body, "This is the third document", &scorer);
 
         let document_term = Term::from_field_text(body, "document");
         let document_term_tree = QueryDocumentTree::Term(document_term);
@@ -286,9 +303,9 @@ mod test {
         let non_existent_term_tree = QueryDocumentTree::Term(non_existent_term);
 
         // When
-        let document_term_score = presearcher.score(&document_term_tree);
-        let first_term_score = presearcher.score(&first_term_tree);
-        let non_existent_term_score = presearcher.score(&non_existent_term_tree);
+        let document_term_score = scorer.score(&document_term_tree);
+        let first_term_score = scorer.score(&first_term_tree);
+        let non_existent_term_score = scorer.score(&non_existent_term_tree);
 
         // Then
         assert_eq!(document_term_score, 0.13353144);
@@ -302,17 +319,10 @@ mod test {
         let mut schema_builder = Schema::builder();
         let body = schema_builder.add_text_field("body", TEXT);
 
-        let mut stats_provider = TestStatisticsProvider {
-            document_count: 0,
-            term_doc_freq: HashMap::<Term, u64>::new(),
-        };
-        stats_provider.add_document("This is the first document");
-        stats_provider.add_document("This is the second document");
-        stats_provider.add_document("This is the third document");
-
-        let presearcher: TermFilteredPresearcher = TermFilteredPresearcher {
-            scorer: Box::new(stats_provider),
-        };
+        let scorer = TfIdfScorer::default();
+        add_document(&body, "This is the first document", &scorer);
+        add_document(&body, "This is the second document", &scorer);
+        add_document(&body, "This is the third document", &scorer);
 
         let document_term = Term::from_field_text(body, "document");
         let document_term_tree = QueryDocumentTree::Term(document_term);
@@ -327,7 +337,7 @@ mod test {
         ]);
 
         // When
-        let disjunction_score = presearcher.score(&disjunction);
+        let disjunction_score = scorer.score(&disjunction);
 
         // Then
         assert_eq!(disjunction_score, 0.13353144);
@@ -339,17 +349,10 @@ mod test {
         let mut schema_builder = Schema::builder();
         let body = schema_builder.add_text_field("body", TEXT);
 
-        let mut stats_provider = TestStatisticsProvider {
-            document_count: 0,
-            term_doc_freq: HashMap::<Term, u64>::new(),
-        };
-        stats_provider.add_document("This is the first document");
-        stats_provider.add_document("This is the second document");
-        stats_provider.add_document("This is the third document");
-
-        let presearcher: TermFilteredPresearcher = TermFilteredPresearcher {
-            scorer: Box::new(stats_provider),
-        };
+        let scorer = TfIdfScorer::default();
+        add_document(&body, "This is the first document", &scorer);
+        add_document(&body, "This is the second document", &scorer);
+        add_document(&body, "This is the third document", &scorer);
 
         let document_term = Term::from_field_text(body, "document");
         let document_term_tree = QueryDocumentTree::Term(document_term);
@@ -364,7 +367,7 @@ mod test {
         ]);
 
         // When
-        let conjunction_score = presearcher.score(&conjunction);
+        let conjunction_score = scorer.score(&conjunction);
 
         // Then
         assert_eq!(conjunction_score, 2.0794415);
@@ -379,21 +382,17 @@ mod test {
 
         let mut field_terms = HashMap::<Field, HashSet<Term>>::new();
 
-        let mut stats_provider = TestStatisticsProvider {
-            document_count: 0,
-            term_doc_freq: HashMap::<Term, u64>::new(),
-        };
-        stats_provider.add_document("This is the first document");
-
-        let presearcher: TermFilteredPresearcher = TermFilteredPresearcher {
-            scorer: Box::new(stats_provider),
+        let scorer = TfIdfScorer::default();
+        add_document(&body, "This is the first document", &scorer);
+        let presearcher: TermFilteredPresearcher<TfIdfScorer> = TermFilteredPresearcher {
+            scorer: Box::new(scorer),
         };
 
         let document_term = Term::from_field_text(body, "document");
         let document_term_tree = QueryDocumentTree::Term(document_term.clone());
 
         // When
-        presearcher.to_field_terms(&document_term_tree, &mut field_terms, index.schema());
+        let _ = presearcher.to_field_terms(&document_term_tree, &mut field_terms, index.schema());
 
         // Then
         let found_field_terms = field_terms.entry(body).or_default();
@@ -404,19 +403,15 @@ mod test {
     fn test_disjunction_to_field_terms() {
         // Given
         let mut schema_builder = Schema::builder();
-        schema_builder.add_text_field("body", TEXT);
+        let body = schema_builder.add_text_field("body", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
 
         let mut field_terms = HashMap::<Field, HashSet<Term>>::new();
 
-        let mut stats_provider = TestStatisticsProvider {
-            document_count: 0,
-            term_doc_freq: HashMap::<Term, u64>::new(),
-        };
-        stats_provider.add_document("This is the first document");
-
-        let presearcher: TermFilteredPresearcher = TermFilteredPresearcher {
-            scorer: Box::new(stats_provider),
+        let scorer = TfIdfScorer::default();
+        add_document(&body, "This is the first document", &scorer);
+        let presearcher: TermFilteredPresearcher<TfIdfScorer> = TermFilteredPresearcher {
+            scorer: Box::new(scorer),
         };
 
         let document_term = Term::from_field_text(Field::from_field_id(0), "document");
@@ -432,7 +427,7 @@ mod test {
         ]);
 
         // When
-        presearcher.to_field_terms(&disjunction, &mut field_terms, index.schema());
+        let _ = presearcher.to_field_terms(&disjunction, &mut field_terms, index.schema());
 
         // Then
         let found_field_terms = field_terms.entry(Field::from_field_id(0)).or_default();
@@ -450,14 +445,10 @@ mod test {
 
         let mut field_terms = HashMap::<Field, HashSet<Term>>::new();
 
-        let mut stats_provider = TestStatisticsProvider {
-            document_count: 0,
-            term_doc_freq: HashMap::<Term, u64>::new(),
-        };
-        stats_provider.add_document("This is the first document");
-
-        let presearcher: TermFilteredPresearcher = TermFilteredPresearcher {
-            scorer: Box::new(stats_provider),
+        let scorer = TfIdfScorer::default();
+        add_document(&body, "This is the first document", &scorer);
+        let presearcher: TermFilteredPresearcher<TfIdfScorer> = TermFilteredPresearcher {
+            scorer: Box::new(scorer),
         };
 
         let document_term = Term::from_field_text(body, "document");

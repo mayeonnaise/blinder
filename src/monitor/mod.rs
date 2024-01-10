@@ -2,19 +2,19 @@ pub(crate) mod query;
 
 pub use self::query::MonitorQuery;
 
-use dashmap::{mapref::entry::Entry, DashMap};
+use dashmap::DashMap;
 
 use std::{
-    collections::HashSet,
-    sync::atomic::{AtomicU64, Ordering},
+    collections::{HashMap, HashSet},
+    fmt::Debug,
 };
 
 use tantivy::{
     collector::{Collector, SegmentCollector},
-    query::{Bm25StatisticsProvider, Query},
-    schema::{Field, Schema},
+    query::Query,
+    schema::{Field, OwnedValue, Schema},
     tokenizer::TokenizerManager,
-    DocAddress, DocId, Index, IndexWriter, Searcher, TantivyDocument, TantivyError, Term,
+    DocAddress, DocId, Document, Index, IndexWriter, Searcher, TantivyDocument, TantivyError,
 };
 
 use crate::{presearcher::Presearcher, query_decomposer::QueryDecomposer};
@@ -45,15 +45,18 @@ impl<P: Presearcher> Monitor<P> {
     }
 
     pub fn schema(&self) -> Schema {
-        self.query_index.schema()
+        self.document_schema.clone()
     }
 
-    pub fn match_document(&self, document: &TantivyDocument) -> Result<HashSet<u64>, TantivyError> {
+    pub fn match_document<D: Clone + Debug + Document>(
+        &self,
+        document: D,
+    ) -> Result<HashSet<u64>, TantivyError> {
         let query_reader = self.query_index.reader()?;
         let query_searcher = query_reader.searcher();
 
         let document_query = self.presearcher.convert_document_to_query(
-            document,
+            &document,
             self.query_index.schema(),
             self.query_index.tokenizers(),
         )?;
@@ -69,9 +72,9 @@ impl<P: Presearcher> Monitor<P> {
 
         let mut actual_query_matches: HashSet<u64> = HashSet::new();
 
-        let index = Index::create_in_ram(self.query_index.schema());
+        let index = Index::create_in_ram(self.document_schema.clone());
 
-        let mut index_writer: IndexWriter = index.writer(15_000_000)?;
+        let mut index_writer: IndexWriter<D> = index.writer(15_000_000)?;
         index_writer.add_document(document.clone())?;
         index_writer.commit()?;
 
@@ -97,21 +100,22 @@ impl<P: Presearcher> Monitor<P> {
         let mut query_decomposer = QueryDecomposer::new(&mut all_subqueries);
         query_decomposer.decompose(monitor_query.query.box_clone());
 
-        let mut index_writer: IndexWriter<TantivyDocument> =
+        let mut index_writer: IndexWriter<HashMap<Field, OwnedValue>> =
             self.query_index.writer(100_000_000)?;
 
         for subquery in all_subqueries {
             let mut subquery_document = self
                 .presearcher
                 .convert_query_to_document(&subquery, self.query_index.schema())?;
-            subquery_document.add_u64(
+            subquery_document.insert(
                 self.query_index
                     .schema()
                     .get_field(MONITOR_QUERY_ID_FIELD_NAME)?,
-                monitor_query.id,
+                OwnedValue::U64(monitor_query.id),
             );
-
+            dbg!("HERE 2");
             index_writer.add_document(subquery_document)?;
+            dbg!("HERE 3");
         }
 
         self.query_store.insert(monitor_query.id, monitor_query);
@@ -237,49 +241,8 @@ impl SegmentCollector for QueryMatchChildCollector {
     }
 }
 
-#[derive(Default)]
-pub struct BasicStatisticsProvider {
-    document_count: AtomicU64,
-    term_doc_freq: DashMap<Term, u64>,
-}
-
-impl Bm25StatisticsProvider for BasicStatisticsProvider {
-    fn total_num_tokens(&self, _: Field) -> tantivy::Result<u64> {
-        Ok(0)
-    }
-
-    fn total_num_docs(&self) -> tantivy::Result<u64> {
-        Ok(self.document_count.load(Ordering::SeqCst))
-    }
-
-    fn doc_freq(&self, term: &Term) -> tantivy::Result<u64> {
-        Ok(self.term_doc_freq.get(term).map_or(0, |freq| *freq))
-    }
-}
-
-impl BasicStatisticsProvider {
-    fn add_term(&self, field: Field, token: &str) {
-        self.document_count.fetch_add(1, Ordering::SeqCst);
-
-        match self
-            .term_doc_freq
-            .entry(Term::from_field_text(field, token))
-        {
-            Entry::Occupied(mut entry) => {
-                let term_frequency = entry.get() + 1;
-                entry.insert(term_frequency);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(1);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
-
     use tantivy::{
         doc,
         query::{BooleanQuery, TermQuery},
@@ -288,9 +251,9 @@ mod test {
         Term,
     };
 
-    use crate::presearcher::TermFilteredPresearcher;
+    use crate::presearcher::{TermFilteredPresearcher, TfIdfScorer};
 
-    use super::{BasicStatisticsProvider, Monitor, *};
+    use super::{Monitor, *};
 
     #[test]
     fn test_monitor_basic() {
@@ -299,13 +262,11 @@ mod test {
         let document_schema = document_schema_builder.build();
 
         let presearcher = TermFilteredPresearcher {
-            scorer: Box::new(BasicStatisticsProvider {
-                document_count: 0.into(),
-                term_doc_freq: DashMap::<Term, u64>::new(),
-            }),
+            scorer: Box::<TfIdfScorer>::default(),
         };
 
-        let monitor = Monitor::<TermFilteredPresearcher>::new(document_schema, presearcher);
+        let monitor =
+            Monitor::<TermFilteredPresearcher<TfIdfScorer>>::new(document_schema, presearcher);
 
         let id = 0;
         let monitor_query = MonitorQuery {
@@ -323,7 +284,7 @@ mod test {
         let document = doc!(body => "Michael Bloomberg");
 
         let matches = monitor
-            .match_document(&document)
+            .match_document(document)
             .expect("Should not error matching document");
 
         assert!(matches.contains(&id));
@@ -331,7 +292,7 @@ mod test {
         let document = doc!(body => "Michael Bay");
 
         let no_matches = monitor
-            .match_document(&document)
+            .match_document(document)
             .expect("Should not error matching document");
 
         assert!(no_matches.is_empty());
@@ -344,13 +305,11 @@ mod test {
         let document_schema = document_schema_builder.build();
 
         let presearcher = TermFilteredPresearcher {
-            scorer: Box::new(BasicStatisticsProvider {
-                document_count: 0.into(),
-                term_doc_freq: DashMap::<Term, u64>::new(),
-            }),
+            scorer: Box::<TfIdfScorer>::default(),
         };
 
-        let mut monitor = Monitor::<TermFilteredPresearcher>::new(document_schema, presearcher);
+        let monitor =
+            Monitor::<TermFilteredPresearcher<TfIdfScorer>>::new(document_schema, presearcher);
 
         let id = 0;
         let monitor_query = MonitorQuery {
@@ -380,7 +339,7 @@ mod test {
         let document = doc!(body => "Michael Bloomberg");
 
         let matches = monitor
-            .match_document(&document)
+            .match_document(document)
             .expect("should not error matching document");
 
         assert!(matches.contains(&id));
@@ -388,7 +347,7 @@ mod test {
         let document = doc!(body => "Donald Trump");
 
         let matches = monitor
-            .match_document(&document)
+            .match_document(document)
             .expect("should not error matching document");
 
         assert!(matches.contains(&id));
@@ -396,7 +355,7 @@ mod test {
         let document = doc!(body => "Bloomberg Trump");
 
         let matches = monitor
-            .match_document(&document)
+            .match_document(document)
             .expect("should not error matching document");
 
         assert!(matches.contains(&id));
@@ -404,7 +363,7 @@ mod test {
         let document = doc!(body => "Rishi Sunak");
 
         let matches = monitor
-            .match_document(&document)
+            .match_document(document)
             .expect("should not error matching document");
 
         assert!(matches.is_empty());

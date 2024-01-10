@@ -4,8 +4,8 @@ extern crate rocket;
 use std::collections::{HashMap, HashSet};
 
 use blinker::{
-    monitor::{BasicStatisticsProvider, Monitor, MonitorQuery},
-    presearcher::TermFilteredPresearcher,
+    monitor::{Monitor, MonitorQuery},
+    presearcher::{TermFilteredPresearcher, TfIdfScorer},
 };
 use rocket::{serde::json::Json, State};
 use serde::{Deserialize, Serialize};
@@ -37,10 +37,12 @@ fn index() -> &'static str {
 #[post("/register_query", format = "application/json", data = "<query>")]
 fn register_query(
     query: Json<SimpleMonitorQuery>,
-    monitor: &State<Monitor<TermFilteredPresearcher>>,
+    monitor: &State<Monitor<TermFilteredPresearcher<TfIdfScorer>>>,
     query_parser: &State<QueryParser>,
 ) {
     let (tantivy_query, _) = query_parser.parse_query_lenient(&query.query);
+
+    dbg!(&tantivy_query);
     let _ = monitor.register_query(MonitorQuery {
         id: query.id,
         query: tantivy_query,
@@ -50,7 +52,7 @@ fn register_query(
 #[post("/match_document", format = "application/json", data = "<document>")]
 fn match_document(
     document: Json<SimpleDocument>,
-    monitor: &State<Monitor<TermFilteredPresearcher>>,
+    monitor: &State<Monitor<TermFilteredPresearcher<TfIdfScorer>>>,
 ) -> Json<MonitorQueryMatches> {
     let mut tantivy_document = TantivyDocument::default();
     let tantivy_schema = monitor.schema();
@@ -60,7 +62,7 @@ fn match_document(
         }
     }
 
-    let matches = monitor.match_document(&tantivy_document);
+    let matches = monitor.match_document(tantivy_document);
     Json(MonitorQueryMatches {
         ids: matches.unwrap(),
     })
@@ -73,10 +75,11 @@ fn rocket() -> _ {
     let document_schema = document_schema_builder.build();
 
     let presearcher = TermFilteredPresearcher {
-        scorer: Box::new(BasicStatisticsProvider::default()),
+        scorer: Box::<TfIdfScorer>::default(),
     };
 
-    let monitor = Monitor::<TermFilteredPresearcher>::new(document_schema, presearcher);
+    let monitor =
+        Monitor::<TermFilteredPresearcher<TfIdfScorer>>::new(document_schema, presearcher);
 
     let query_parser = QueryParser::new(monitor.schema(), Vec::new(), monitor.tokenizers().clone());
 
