@@ -98,7 +98,7 @@ mod test {
     fn add_document<P: PresearcherScorer>(field: &Field, value: &str, scorer: &P) {
         scorer.add_document_count();
         for text in value.split_whitespace() {
-            scorer.add_term(Term::from_field_text(field.clone(), text));
+            scorer.add_term(Term::from_field_text(*field, text));
         }
     }
 

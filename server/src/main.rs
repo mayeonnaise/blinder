@@ -1,12 +1,16 @@
 #[macro_use]
 extern crate rocket;
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 use blinker::{
-    monitor::{Monitor, MonitorQuery},
-    presearcher::{TermFilteredPresearcher, TfIdfScorer},
+    monitor::{Monitor, MonitorMatcher, MonitorQuery},
+    presearcher::{PresearcherMetrics, TermFilteredPresearcher, TfIdfScorer},
 };
+use once_cell::sync::Lazy;
 use rocket::{serde::json::Json, State};
 use serde::{Deserialize, Serialize};
 use tantivy::{
@@ -15,18 +19,29 @@ use tantivy::{
     TantivyDocument,
 };
 
-#[derive(Deserialize)]
-pub struct SimpleMonitorQuery {
-    pub id: u64,
-    pub query: String,
+static MONITOR: Lazy<Monitor<TermFilteredPresearcher<TfIdfScorer>>> = Lazy::new(|| {
+    let mut document_schema_builder = Schema::builder();
+    document_schema_builder.add_text_field("body", TEXT);
+    let document_schema = document_schema_builder.build();
+
+    let presearcher = TermFilteredPresearcher::default();
+    Monitor::<TermFilteredPresearcher<TfIdfScorer>>::new(document_schema, presearcher)
+});
+
+thread_local! {
+    static MONITOR_MATCHER: RefCell<tantivy::Result<MonitorMatcher<'static, TermFilteredPresearcher<TfIdfScorer>, TantivyDocument>>> = RefCell::new(MONITOR.matcher());
 }
 
 #[derive(Deserialize)]
-pub struct SimpleDocument(HashMap<String, String>);
+struct SimpleMonitorQuery {
+    id: u64,
+    query: String,
+}
 
 #[derive(Default, Serialize)]
-pub struct MonitorQueryMatches {
-    pub ids: HashSet<u64>,
+struct MonitorQueryMatches {
+    ids: HashSet<u64>,
+    metrics: PresearcherMetrics,
 }
 
 #[get("/")]
@@ -37,50 +52,45 @@ fn index() -> &'static str {
 #[post("/register_query", format = "application/json", data = "<query>")]
 fn register_query(
     query: Json<SimpleMonitorQuery>,
-    monitor: &State<Monitor<TermFilteredPresearcher<TfIdfScorer>>>,
+    monitor: &State<&Monitor<TermFilteredPresearcher<TfIdfScorer>>>,
     query_parser: &State<QueryParser>,
 ) {
     let (tantivy_query, _) = query_parser.parse_query_lenient(&query.query);
-
-    dbg!(&tantivy_query);
-    let _ = monitor.register_query(MonitorQuery {
-        id: query.id,
-        query: tantivy_query,
-    });
+    monitor
+        .register_query(MonitorQuery {
+            id: query.id,
+            query: tantivy_query,
+        })
+        .unwrap();
 }
 
 #[post("/match_document", format = "application/json", data = "<document>")]
 fn match_document(
-    document: Json<SimpleDocument>,
-    monitor: &State<Monitor<TermFilteredPresearcher<TfIdfScorer>>>,
+    document: Json<HashMap<String, String>>,
+    monitor: &State<&Monitor<TermFilteredPresearcher<TfIdfScorer>>>,
 ) -> Json<MonitorQueryMatches> {
     let mut tantivy_document = TantivyDocument::default();
-    let tantivy_schema = monitor.schema();
-    for (field_name, value) in document.0 .0 {
-        if let Some((field, _)) = tantivy_schema.find_field(&field_name) {
+    let schema = monitor.schema();
+
+    for (field_name, value) in document.into_inner() {
+        if let Some((field, _)) = schema.find_field(&field_name) {
             tantivy_document.add_text(field, value);
         }
     }
 
-    let matches = monitor.match_document(tantivy_document);
+    let (matches, metrics) = MONITOR_MATCHER
+        .with_borrow_mut(|matcher| matcher.as_mut().unwrap().match_document(tantivy_document))
+        .unwrap();
+
     Json(MonitorQueryMatches {
-        ids: matches.unwrap(),
+        ids: matches,
+        metrics,
     })
 }
 
 #[launch]
 fn rocket() -> _ {
-    let mut document_schema_builder = Schema::builder();
-    let _ = document_schema_builder.add_text_field("body", TEXT);
-    let document_schema = document_schema_builder.build();
-
-    let presearcher = TermFilteredPresearcher {
-        scorer: Box::<TfIdfScorer>::default(),
-    };
-
-    let monitor =
-        Monitor::<TermFilteredPresearcher<TfIdfScorer>>::new(document_schema, presearcher);
-
+    let monitor = Lazy::force(&MONITOR);
     let query_parser = QueryParser::new(monitor.schema(), Vec::new(), monitor.tokenizers().clone());
 
     rocket::build()

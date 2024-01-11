@@ -1,3 +1,4 @@
+pub mod memory_index;
 pub mod monitor;
 pub mod presearcher;
 

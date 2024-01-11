@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Debug,
-};
+use std::collections::{HashMap, HashSet};
 
 use tantivy::{
     query::{BooleanQuery, Query, QueryDocumentTree, TermQuery, TermSetQuery},
@@ -15,6 +12,7 @@ use crate::monitor::query::ANYTERM_FIELD;
 
 use super::{Presearcher, PresearcherScorer};
 
+#[derive(Clone, Debug, Default)]
 pub struct TermFilteredPresearcher<S: PresearcherScorer> {
     pub scorer: Box<S>,
 }
@@ -73,7 +71,8 @@ impl<S: PresearcherScorer> Presearcher for TermFilteredPresearcher<S> {
     ) -> Result<HashMap<Field, OwnedValue>, TantivyError> {
         let mut document = HashMap::<Field, OwnedValue>::new();
         let mut field_terms = HashMap::<Field, HashSet<Term>>::new();
-        self.to_field_terms(&query.to_ast(), &mut field_terms, schema.clone())?;
+        let ast = query.to_ast();
+        self.to_field_terms(&ast, &mut field_terms, schema.clone())?;
 
         for (field, terms) in field_terms.into_iter() {
             let field_entry = schema.get_field_entry(field);
@@ -103,9 +102,9 @@ impl<S: PresearcherScorer> Presearcher for TermFilteredPresearcher<S> {
         Ok(document)
     }
 
-    fn convert_document_to_query<D: Debug + Document>(
+    fn convert_document_to_query(
         &self,
-        document: &D,
+        document: &impl Document,
         schema: Schema,
         tokenizer_manager: &TokenizerManager,
     ) -> Result<Box<dyn Query>, TantivyError> {
@@ -121,9 +120,7 @@ impl<S: PresearcherScorer> Presearcher for TermFilteredPresearcher<S> {
                 tantivy::schema::FieldType::JsonObject(options) => {
                     options.get_text_indexing_options()
                 }
-                _ => {
-                    continue;
-                }
+                _ => continue,
             };
             let indexing_options = indexing_options_opt.ok_or_else(|| {
                 TantivyError::InvalidArgument(format!(
@@ -185,7 +182,7 @@ mod test {
     fn add_document<P: PresearcherScorer>(field: &Field, value: &str, scorer: &P) {
         scorer.add_document_count();
         for text in value.split_whitespace() {
-            scorer.add_term(Term::from_field_text(field.clone(), text));
+            scorer.add_term(Term::from_field_text(*field, text));
         }
     }
 

@@ -41,11 +41,11 @@ pub struct MonitorQuerySchemaBuilder;
 impl MonitorQuerySchemaBuilder {
     pub fn build(schema: Schema) -> Schema {
         let mut schema_builder = Schema::builder();
-        schema_builder.add_u64_field(MONITOR_QUERY_ID_FIELD_NAME, INDEXED | STORED);
-        schema_builder.add_bool_field(ANYTERM_FIELD, INDEXED);
         for (_, field_entry) in schema.fields() {
             schema_builder.add_field(field_entry.clone());
         }
+        schema_builder.add_u64_field(MONITOR_QUERY_ID_FIELD_NAME, INDEXED | STORED);
+        schema_builder.add_bool_field(ANYTERM_FIELD, INDEXED);
         schema_builder.build()
     }
 }

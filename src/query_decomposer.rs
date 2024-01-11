@@ -25,12 +25,12 @@ impl<'a> QueryDecomposer<'a> {
         };
 
         let query = match query.downcast::<BoostQuery>() {
-            Ok(query) => return decomposer.decompose_boost(query),
+            Ok(query) => return decomposer.decompose_boost(&query),
             Err(query) => query,
         };
 
         let query = match query.downcast::<DisjunctionMaxQuery>() {
-            Ok(query) => return decomposer.decompose_disjunction_max(query),
+            Ok(query) => return decomposer.decompose_disjunction_max(&query),
             Err(query) => query,
         };
 
@@ -85,7 +85,7 @@ impl<'a> QueryDecomposer<'a> {
         }
     }
 
-    fn decompose_boost(&mut self, query: Box<BoostQuery>) {
+    fn decompose_boost(&mut self, query: &BoostQuery) {
         if query.boost() == 1.0 {
             return self.decompose(query.query());
         }
@@ -96,7 +96,7 @@ impl<'a> QueryDecomposer<'a> {
         }
     }
 
-    fn decompose_disjunction_max(&mut self, query: Box<DisjunctionMaxQuery>) {
+    fn decompose_disjunction_max(&mut self, query: &DisjunctionMaxQuery) {
         for subquery in query.disjuncts() {
             self.decompose(subquery.box_clone());
         }
